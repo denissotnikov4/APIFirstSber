@@ -1,0 +1,538 @@
+openapi: 3.0.3
+info:
+  title: Cinema API
+  version: 1.1.0
+  description: |
+    Афиша, расписание, схема зала, бронирование и продажа билетов.
+    Публичный каталог доступен без авторизации. Бронирования принадлежат
+    пользователю из JWT; идентификатор владельца не принимается от клиента.
+    Денежные суммы передаются в копейках, валюта — RUB.
+servers:
+  - url: http://localhost:8080
+    description: Локальный сервер
+tags:
+  - name: Catalog
+    description: Афиша и сеансы
+  - name: Reservations
+    description: Бронирование, покупка и отмена
+paths:
+  /api/v1/movies:
+    get:
+      tags: [Catalog]
+      operationId: listMovies
+      summary: Получить афишу с расписанием сеансов на дату
+      description: |
+        Возвращает фильмы, имеющие сеансы в выбранную календарную дату по часовому
+        поясу кинотеатра Asia/Yekaterinburg. Фильмы отсортированы по title, затем id;
+        сеансы — по startsAt, затем id. Страница за границей выборки содержит пустой items.
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Дата афиши по местному времени кинотеатра.
+          schema:
+            type: string
+            format: date
+          example: '2026-11-15'
+        - name: page
+          in: query
+          description: Номер страницы, начиная с нуля.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: size
+          in: query
+          description: Максимальное количество фильмов на странице.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Страница афиши; при отсутствии сеансов items пуст.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MoviePageDto'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+  /api/v1/sessions/{sessionId}:
+    get:
+      tags: [Catalog]
+      operationId: getSession
+      summary: Получить один сеанс и схему зала с доступностью мест
+      description: Доступность является снимком; окончательная проверка мест выполняется атомарно при бронировании.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: Публичный идентификатор сеанса.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Сеанс, фильм и схема зала.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetailsDto'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Сеанс с указанным идентификатором не существует.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDto'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+  /api/v1/reservations:
+    post:
+      tags: [Reservations]
+      operationId: createReservation
+      summary: Забронировать места на сеанс на 15 минут
+      description: |
+        Все места резервируются атомарно либо возвращается 409. Цена рассчитывается
+        сервером. Первый запрос возвращает 201, повтор с тем же ключом и теми же
+        sessionId и множеством seatIds возвращает 200 и актуальную бронь, не продлевая
+        её срок. Другое содержимое с тем же ключом — 409. Ключ действует 24 часа
+        в рамках пользователя; параллельные повторы не создают дополнительные брони.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Уникальный ключ запроса для безопасного повтора создания брони.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReservationDto'
+      responses:
+        '201':
+          description: Бронь создана; Location указывает URI созданного ресурса.
+          headers:
+            Location:
+              $ref: '#/components/headers/ReservationLocation'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationDto'
+        '200':
+          description: Повторный запрос; возвращена существующая бронь.
+          headers:
+            Location:
+              $ref: '#/components/headers/ReservationLocation'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationDto'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Сеанс или одно из мест в его зале не найдены.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDto'
+        '409':
+          description: Места заняты, сеанс уже начался или ключ повторно использован с другим телом.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDto'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+  /api/v1/reservations/{reservationId}:
+    patch:
+      tags: [Reservations]
+      operationId: updateReservation
+      summary: Подтвердить покупку забронированных билетов
+      description: |
+        Частичное обновление application/json по схеме UpdateReservationDto (не JSON Patch).
+        Единственное разрешённое изменение — status=PAID с paymentReference.
+        Переводит HELD в PAID и выдаёт билеты. Сервис проверяет подтверждение оплаты
+        у платёжного провайдера: сумму, валюту и привязку к брони. Карточные данные
+        не передаются. Повтор с тем же paymentReference возвращает те же билеты.
+        Смена подтверждения у оплаченной брони запрещена (409). Проверка срока,
+        переход состояния и выпуск билетов выполняются атомарно; повтор не выпускает
+        новые билеты. Конкурирующие покупка и отмена не могут обе завершиться успешно.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ReservationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateReservationDto'
+      responses:
+        '200':
+          description: Оплаченная бронь с билетами, включая повторное подтверждение.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationDto'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ReservationNotFound'
+        '409':
+          description: Бронь истекла, отменена, сеанс начался или подтверждение оплаты не соответствует брони.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDto'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [Reservations]
+      operationId: cancelReservation
+      summary: Отменить неоплаченную бронь и освободить места
+      description: |
+        Переводит HELD в CANCELLED. Повторная отмена возвращает 200 с тем же
+        результатом. Оплаченные и истёкшие брони возвращают 409; возврат купленных
+        билетов не входит в этот API. Запись сохраняется для повторных запросов.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ReservationId'
+      responses:
+        '200':
+          description: Бронь отменена, статус CANCELLED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationDto'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ReservationNotFound'
+        '409':
+          description: Бронь уже оплачена или истекла.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDto'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+components:
+  headers:
+    ReservationLocation:
+      description: URI брони; в пределах пяти операций доступны PATCH и DELETE по этому URI.
+      schema:
+        type: string
+        format: uri-reference
+        example: /api/v1/reservations/550e8400-e29b-41d4-a716-446655440000
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT идентифицирует покупателя; выдача токенов находится вне этого API.
+  parameters:
+    ReservationId:
+      name: reservationId
+      in: path
+      required: true
+      description: Публичный идентификатор бронирования.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    InternalServerError:
+      description: Непредвиденная ошибка сервера; внутренние подробности не раскрываются.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDto'
+    NotImplemented:
+      description: Операция описана контрактом, но бизнес-логика каркаса ещё не реализована.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDto'
+    BadRequest:
+      description: Некорректный UUID, дата, пагинация или тело запроса; нарушены ограничения DTO.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDto'
+    Unauthorized:
+      description: Не знаю, кто ты — JWT отсутствует, недействителен или истёк.
+      headers:
+        WWW-Authenticate:
+          description: Требуемая схема аутентификации.
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDto'
+    Forbidden:
+      description: Знаю, кто ты, но нельзя — пользователь аутентифицирован, однако бронь принадлежит другому покупателю.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDto'
+    ReservationNotFound:
+      description: Бронь с указанным идентификатором не существует.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDto'
+  schemas:
+    MovieDto:
+      type: object
+      required: [id, title, durationMinutes, ageRating]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          example: Интерстеллар
+        durationMinutes:
+          type: integer
+          minimum: 1
+          example: 169
+        ageRating:
+          type: string
+          enum: ['0+', '6+', '12+', '16+', '18+']
+    SessionDto:
+      type: object
+      required: [id, startsAt, hallName, priceKopecks]
+      properties:
+        id:
+          type: string
+          format: uuid
+        startsAt:
+          type: string
+          format: date-time
+          example: '2026-11-15T19:00:00+05:00'
+        hallName:
+          type: string
+          example: Зал 1
+        priceKopecks:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Одинаковая цена за каждое место этого сеанса, в копейках (RUB).
+          example: 45000
+    MovieScheduleDto:
+      type: object
+      required: [movie, sessions]
+      properties:
+        movie:
+          $ref: '#/components/schemas/MovieDto'
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionDto'
+    MoviePageDto:
+      type: object
+      required: [items, page, size, totalElements]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MovieScheduleDto'
+        page:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          minimum: 1
+          maximum: 100
+        totalElements:
+          type: integer
+          format: int64
+          minimum: 0
+    SeatDto:
+      type: object
+      required: [id, row, number, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        row:
+          type: integer
+          minimum: 1
+          description: Ряд от экрана; экран перед первым рядом.
+        number:
+          type: integer
+          minimum: 1
+          description: Номер места слева направо при взгляде на экран.
+        status:
+          type: string
+          enum: [AVAILABLE, HELD, SOLD]
+    SessionDetailsDto:
+      type: object
+      required: [session, movie, seats]
+      properties:
+        session:
+          $ref: '#/components/schemas/SessionDto'
+        movie:
+          $ref: '#/components/schemas/MovieDto'
+        seats:
+          type: array
+          description: Все реальные места зала; отсутствующие координаты означают проходы.
+          items:
+            $ref: '#/components/schemas/SeatDto'
+    CreateReservationDto:
+      type: object
+      additionalProperties: false
+      required: [sessionId, seatIds]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+        seatIds:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+    UpdateReservationDto:
+      type: object
+      additionalProperties: false
+      required: [status, paymentReference]
+      properties:
+        status:
+          type: string
+          enum: [PAID]
+          description: Запрашиваемое состояние; применяется только после проверки оплаты сервером.
+        paymentReference:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: Непрозрачный идентификатор подтверждённой оплаты у провайдера; не данные карты.
+          example: pay_example_123
+    ReservationDto:
+      type: object
+      required: [id, sessionId, seatIds, status, expiresAt, totalKopecks, tickets]
+      properties:
+        id:
+          type: string
+          format: uuid
+        sessionId:
+          type: string
+          format: uuid
+        seatIds:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        status:
+          type: string
+          enum: [HELD, PAID, CANCELLED, EXPIRED]
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок оплаты; после него HELD становится EXPIRED и места освобождаются. Для PAID срок больше не применяется.
+        totalKopecks:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Зафиксированная сервером сумма брони в копейках (RUB).
+        tickets:
+          type: array
+          description: Для PAID — один билет на каждое место; для остальных статусов пустой массив.
+          items:
+            $ref: '#/components/schemas/TicketDto'
+    TicketDto:
+      type: object
+      required: [id, seatId, admissionCode]
+      properties:
+        id:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+        admissionCode:
+          type: string
+          description: Непрозрачный код для контроля входа; доступен только владельцу билета.
+    ProblemDto:
+      type: object
+      description: RFC 9457 Problem Details; дополнительные поля code и errors расширяют стандарт.
+      required: [type, title, status, detail, instance, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: about:blank
+        title:
+          type: string
+          example: Not Found
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          example: 404
+        detail:
+          type: string
+          description: Безопасное описание без SQL, stack trace и внутренних данных.
+          example: Бронь не найдена.
+        instance:
+          type: string
+          format: uri-reference
+          description: Путь запроса без query-параметров и секретов.
+          example: /api/v1/reservations/550e8400-e29b-41d4-a716-446655440000
+        code:
+          type: string
+          description: Стабильный машинный код ошибки.
+          example: RESERVATION_NOT_FOUND
+        errors:
+          type: array
+          description: Ошибки валидации без отклонённых значений.
+          items:
+            $ref: '#/components/schemas/FieldViolationDto'
+    FieldViolationDto:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          example: seatIds
+        message:
+          type: string
+          example: size must be between 1 and 10

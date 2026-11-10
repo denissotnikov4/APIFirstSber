@@ -1,0 +1,17 @@
+groupId: ru.cinema
+artifactId: cinema-service
+artifactVersion: 1.1.0
+apiPackage: ru.cinema.api
+modelPackage: ru.cinema.dto
+basePackage: ru.cinema
+configPackage: ru.cinema.configuration
+useSpringBoot3: true
+delegatePattern: true
+useTags: true
+hideGenerationTimestamp: true
+documentationProvider: springdoc
+annotationLibrary: swagger2
+dateLibrary: java8
+useBeanValidation: true
+openApiNullable: false
+generatedConstructorWithRequiredArgs: true
